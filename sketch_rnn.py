@@ -4,11 +4,12 @@ import PIL
 
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 from torch import optim
 import torch.nn.functional as F
 
 use_cuda = torch.cuda.is_available()
+device = torch.device("cuda" if use_cuda else "cpu")
+
 
 ###################################### hyperparameters
 class HParams():
@@ -18,7 +19,7 @@ class HParams():
         self.dec_hidden_size = 512
         self.Nz = 128
         self.M = 20
-        self.dropout = 0.9
+        self.dropout = 0.0
         self.batch_size = 100
         self.eta_min = 0.01
         self.R = 0.99995
@@ -30,7 +31,7 @@ class HParams():
         self.grad_clip = 1.
         self.temperature = 0.4
         self.max_seq_length = 200
-
+        self.lstm_num_layers = 1
 hp = HParams()
 
 ################################# load and prepare data
@@ -94,10 +95,7 @@ def make_batch(batch_size):
         strokes.append(new_seq)
         indice += 1
 
-    if use_cuda:
-        batch = Variable(torch.from_numpy(np.stack(strokes,1)).cuda().float())
-    else:
-        batch = Variable(torch.from_numpy(np.stack(strokes,1)).float())
+    batch = torch.from_numpy(np.stack(strokes,1)).float().to(device)
     return batch, lengths
 
 ################################ adaptive lr
@@ -113,8 +111,11 @@ class EncoderRNN(nn.Module):
     def __init__(self):
         super(EncoderRNN, self).__init__()
         # bidirectional lstm:
-        self.lstm = nn.LSTM(5, hp.enc_hidden_size, \
-            dropout=hp.dropout, bidirectional=True)
+        self.lstm = nn.LSTM(5, hp.enc_hidden_size,
+                            dropout=hp.dropout, 
+                            num_layers=hp.lstm_num_layers, 
+                            bidirectional=True)
+
         # create mu and sigma from lstm's last output:
         self.fc_mu = nn.Linear(2*hp.enc_hidden_size, hp.Nz)
         self.fc_sigma = nn.Linear(2*hp.enc_hidden_size, hp.Nz)
@@ -122,15 +123,14 @@ class EncoderRNN(nn.Module):
         self.train()
 
     def forward(self, inputs, batch_size, hidden_cell=None):
+        # init hidden,cell with zeros
         if hidden_cell is None:
-            # then must init with zeros
-            if use_cuda:
-                hidden = Variable(torch.zeros(2, batch_size, hp.enc_hidden_size).cuda())
-                cell = Variable(torch.zeros(2, batch_size, hp.enc_hidden_size).cuda())
-            else:
-                hidden = Variable(torch.zeros(2, batch_size, hp.enc_hidden_size))
-                cell = Variable(torch.zeros(2, batch_size, hp.enc_hidden_size))
+            hidden = torch.zeros(2*hp.lstm_num_layers, batch_size, hp.enc_hidden_size)
+            cell = torch.zeros(2*hp.lstm_num_layers, batch_size, hp.enc_hidden_size)
+            hidden.to(device)
+            cell.to(device)
             hidden_cell = (hidden, cell)
+
         _, (hidden,cell) = self.lstm(inputs.float(), hidden_cell)
         # hidden is (2, batch_size, hidden_size), we want (batch_size, 2*hidden_size):
         hidden_forward, hidden_backward = torch.split(hidden,1,0)
@@ -141,10 +141,7 @@ class EncoderRNN(nn.Module):
         sigma = torch.exp(sigma_hat/2.)
         # N ~ N(0,1)
         z_size = mu.size()
-        if use_cuda:
-            N = Variable(torch.normal(torch.zeros(z_size),torch.ones(z_size)).cuda())
-        else:
-            N = Variable(torch.normal(torch.zeros(z_size),torch.ones(z_size)))
+        N = torch.normal(torch.zeros(z_size),torch.ones(z_size)).to(device)
         z = mu + sigma*N
         # mu and sigma_hat are needed for LKL loss
         return z, mu, sigma_hat
@@ -155,14 +152,15 @@ class DecoderRNN(nn.Module):
         # to init hidden and cell from z:
         self.fc_hc = nn.Linear(hp.Nz, 2*hp.dec_hidden_size)
         # unidirectional lstm:
-        self.lstm = nn.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
+        self.lstm = nn.LSTM(hp.Nz+5, hp.dec_hidden_size,\
+            num_layers=hp.lstm_num_layers,dropout=hp.dropout)
         # create proba distribution parameters from hiddens:
         self.fc_params = nn.Linear(hp.dec_hidden_size,6*hp.M+3)
 
     def forward(self, inputs, z, hidden_cell=None):
         if hidden_cell is None:
             # then we must init from z
-            hidden,cell = torch.split(F.tanh(self.fc_hc(z)),hp.dec_hidden_size,1)
+            hidden,cell = torch.split(torch.tanh(self.fc_hc(z)),hp.dec_hidden_size,1)
             hidden_cell = (hidden.unsqueeze(0).contiguous(), cell.unsqueeze(0).contiguous())
         outputs,(hidden,cell) = self.lstm(inputs, hidden_cell)
         # in training we feed the lstm with the whole input in one shot
@@ -183,47 +181,36 @@ class DecoderRNN(nn.Module):
             len_out = Nmax+1
         else:
             len_out = 1
-        pi = F.softmax(pi.t().squeeze()).view(len_out,-1,hp.M)
-        sigma_x = torch.exp(sigma_x.t().squeeze()).view(len_out,-1,hp.M)
-        sigma_y = torch.exp(sigma_y.t().squeeze()).view(len_out,-1,hp.M)
-        rho_xy = torch.tanh(rho_xy.t().squeeze()).view(len_out,-1,hp.M)
-        mu_x = mu_x.t().squeeze().contiguous().view(len_out,-1,hp.M)
-        mu_y = mu_y.t().squeeze().contiguous().view(len_out,-1,hp.M)
-        q = F.softmax(params_pen).view(len_out,-1,3)
+        pi = F.softmax(pi.transpose(0,1).squeeze(),dim=0).view(len_out,-1,hp.M)
+        sigma_x = torch.exp(sigma_x.transpose(0,1).squeeze()).view(len_out,-1,hp.M)
+        sigma_y = torch.exp(sigma_y.transpose(0,1).squeeze()).view(len_out,-1,hp.M)
+        rho_xy = torch.tanh(rho_xy.transpose(0,1).squeeze()).view(len_out,-1,hp.M)
+        mu_x = mu_x.transpose(0,1).squeeze().contiguous().view(len_out,-1,hp.M)
+        mu_y = mu_y.transpose(0,1).squeeze().contiguous().view(len_out,-1,hp.M)
+        q = F.softmax(params_pen,dim=0).view(len_out,-1,3)
         return pi,mu_x,mu_y,sigma_x,sigma_y,rho_xy,q,hidden,cell
 
 class Model():
     def __init__(self):
-        if use_cuda:
-            self.encoder = EncoderRNN().cuda()
-            self.decoder = DecoderRNN().cuda()
-        else:
-            self.encoder = EncoderRNN()
-            self.decoder = DecoderRNN()
+        self.encoder = EncoderRNN().to(device)
+        self.decoder = DecoderRNN().to(device)
         self.encoder_optimizer = optim.Adam(self.encoder.parameters(), hp.lr)
         self.decoder_optimizer = optim.Adam(self.decoder.parameters(), hp.lr)
         self.eta_step = hp.eta_min
 
     def make_target(self, batch, lengths):
-        if use_cuda:
-            eos = Variable(torch.stack([torch.Tensor([0,0,0,0,1])]\
-                *batch.size()[1]).cuda()).unsqueeze(0)
-        else:
-            eos = Variable(torch.stack([torch.Tensor([0,0,0,0,1])]\
-                *batch.size()[1])).unsqueeze(0)
+        eos = torch.stack([torch.Tensor([0,0,0,0,1])]\
+                *batch.size()[1]).to(device).unsqueeze(0)
         batch = torch.cat([batch, eos], 0)
         mask = torch.zeros(Nmax+1, batch.size()[1])
         for indice,length in enumerate(lengths):
             mask[:length,indice] = 1
-        if use_cuda:
-            mask = Variable(mask.cuda()).detach()
-        else:
-            mask = Variable(mask).detach()
-        dx = torch.stack([Variable(batch.data[:,:,0])]*hp.M,2).detach()
-        dy = torch.stack([Variable(batch.data[:,:,1])]*hp.M,2).detach()
-        p1 = Variable(batch.data[:,:,2]).detach()
-        p2 = Variable(batch.data[:,:,3]).detach()
-        p3 = Variable(batch.data[:,:,4]).detach()
+        mask = mask.to(device).detach()
+        dx = torch.stack([batch.data[:,:,0]]*hp.M,2).detach()
+        dy = torch.stack([batch.data[:,:,1]]*hp.M,2).detach()
+        p1 = batch.data[:,:,2].detach()
+        p2 = batch.data[:,:,3].detach()
+        p3 = batch.data[:,:,4].detach()
         p = torch.stack([p1,p2,p3],2)
         return mask,dx,dy,p
 
@@ -234,12 +221,8 @@ class Model():
         # encode:
         z, self.mu, self.sigma = self.encoder(batch, hp.batch_size)
         # create start of sequence:
-        if use_cuda:
-            sos = Variable(torch.stack([torch.Tensor([0,0,1,0,0])]\
-                *hp.batch_size).cuda()).unsqueeze(0)
-        else:
-            sos = Variable(torch.stack([torch.Tensor([0,0,1,0,0])]\
-                *hp.batch_size)).unsqueeze(0)
+        sos = torch.stack([torch.Tensor([0,0,1,0,0])]\
+                *hp.batch_size).to(device).unsqueeze(0)
         # had sos at the begining of the batch:
         batch_init = torch.cat([sos, batch],0)
         # expend z to be ready to concatenate with inputs:
@@ -263,14 +246,14 @@ class Model():
         # gradient step
         loss.backward()
         # gradient cliping
-        nn.utils.clip_grad_norm(self.encoder.parameters(), hp.grad_clip)
-        nn.utils.clip_grad_norm(self.decoder.parameters(), hp.grad_clip)
+        nn.utils.clip_grad_norm_(self.encoder.parameters(), hp.grad_clip)
+        nn.utils.clip_grad_norm_(self.decoder.parameters(), hp.grad_clip)
         # optim step
         self.encoder_optimizer.step()
         self.decoder_optimizer.step()
         # some print and save:
         if epoch%1==0:
-            print('epoch',epoch,'loss',loss.data[0],'LR',LR.data[0],'LKL',LKL.data[0])
+            print('epoch',epoch,'loss',loss.item(),'LR',LR.item(),'LKL',LKL.item())
             self.encoder_optimizer = lr_decay(self.encoder_optimizer)
             self.decoder_optimizer = lr_decay(self.decoder_optimizer)
         if epoch%100==0:
@@ -294,13 +277,14 @@ class Model():
         return LS+LP
 
     def kullback_leibler_loss(self):
+
         LKL = -0.5*torch.sum(1+self.sigma-self.mu**2-torch.exp(self.sigma))\
             /float(hp.Nz*hp.batch_size)
-        if use_cuda:
-            KL_min = Variable(torch.Tensor([hp.KL_min]).cuda()).detach()
-        else:
-            KL_min = Variable(torch.Tensor([hp.KL_min])).detach()
+       
+        KL_min = torch.Tensor([hp.KL_min]).to(device).detach()
+
         return hp.wKL*self.eta_step * torch.max(LKL,KL_min)
+
 
     def save(self, epoch):
         sel = np.random.rand()
@@ -322,10 +306,7 @@ class Model():
         self.decoder.train(False)
         # encode:
         z, _, _ = self.encoder(batch, 1)
-        if use_cuda:
-            sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1).cuda())
-        else:
-            sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1))
+        sos = torch.Tensor([0,0,1,0,0]).view(1,1,-1).to(device)
         s = sos
         seq_x = []
         seq_y = []
@@ -377,27 +358,29 @@ class Model():
         sigma_x = self.sigma_x.data[0,0,pi_idx]
         sigma_y = self.sigma_y.data[0,0,pi_idx]
         rho_xy = self.rho_xy.data[0,0,pi_idx]
-        x,y = sample_bivariate_normal(mu_x,mu_y,sigma_x,sigma_y,rho_xy,greedy=False)
+        xy = sample_bivariate_normal(mu_x,mu_y,sigma_x,sigma_y,rho_xy,greedy=False)
+        x=xy[0]
+        y=xy[1]
         next_state = torch.zeros(5)
         next_state[0] = x
         next_state[1] = y
         next_state[q_idx+2] = 1
-        if use_cuda:
-            return Variable(next_state.cuda()).view(1,1,-1),x,y,q_idx==1,q_idx==2
-        else:
-            return Variable(next_state).view(1,1,-1),x,y,q_idx==1,q_idx==2
+        return next_state.to(device).view(1,1,-1),x,y,q_idx==1,q_idx==2
 
 def sample_bivariate_normal(mu_x,mu_y,sigma_x,sigma_y,rho_xy, greedy=False):
     # inputs must be floats
     if greedy:
-      return mu_x,mu_y
-    mean = [mu_x, mu_y]
+      return torch.tensor([mu_x,mu_y])
     sigma_x *= np.sqrt(hp.temperature)
     sigma_y *= np.sqrt(hp.temperature)
     cov = [[sigma_x * sigma_x, rho_xy * sigma_x * sigma_y],\
         [rho_xy * sigma_x * sigma_y, sigma_y * sigma_y]]
-    x = np.random.multivariate_normal(mean, cov, 1)
-    return x[0][0], x[0][1]
+  
+    mu = torch.tensor([mu_x,mu_y])
+    cov = torch.tensor(cov)
+    MVN = torch.distributions.MultivariateNormal
+    p_xy = MVN(loc=mu,covariance_matrix=cov)
+    return p_xy.sample()
 
 def make_image(sequence, epoch, name='_output_'):
     """plot drawing with separated strokes"""
