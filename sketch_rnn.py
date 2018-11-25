@@ -18,7 +18,7 @@ class HParams():
         self.enc_hidden_size = 256
         self.dec_hidden_size = 512
         self.Nz = 128
-        self.M = 20
+        self.M = 20 # num mixtures in dx,dy distribution
         self.dropout = 0.0
         self.batch_size = 100
         self.eta_min = 0.01
@@ -32,7 +32,11 @@ class HParams():
         self.temperature = 0.4
         self.max_seq_length = 200
         self.lstm_num_layers = 1
+        self.limit = 1000 # see comment in purify()
+        self.bidirectional=True
 hp = HParams()
+
+
 
 ################################# load and prepare data
 def max_size(data):
@@ -45,8 +49,10 @@ def purify(strokes):
     data = []
     for seq in strokes:
         if len(seq[:,0]) <= hp.max_seq_length and len(seq[:,0])>10:
-            seq = np.minimum(seq, 1000)
-            seq = np.maximum(seq, -1000)
+             # Removes large gaps in the data. x and y offsets are clamped to
+             # have absolute value no greater than this limit.
+            seq = np.minimum(seq, hp.limit)
+            seq = np.maximum(seq, -hp.limit)
             seq = np.array(seq, dtype=np.float32)
             data.append(seq)
     return data
@@ -117,22 +123,32 @@ class EncoderRNN(nn.Module):
                             bidirectional=True)
 
         # create mu and sigma from lstm's last output:
-        self.fc_mu = nn.Linear(2*hp.enc_hidden_size, hp.Nz)
-        self.fc_sigma = nn.Linear(2*hp.enc_hidden_size, hp.Nz)
+        dirs = 2 if hp.bidirectional==True else 1
+        fc_input_size = dirs*hp.enc_hidden_size
+        self.fc_mu = nn.Linear(fc_input_size, hp.Nz)
+        self.fc_sigma = nn.Linear(fc_input_size, hp.Nz)
         # active dropout:
         self.train()
 
     def forward(self, inputs, batch_size, hidden_cell=None):
         # init hidden,cell with zeros
         if hidden_cell is None:
-            hidden = torch.zeros(2*hp.lstm_num_layers, batch_size, hp.enc_hidden_size)
-            cell = torch.zeros(2*hp.lstm_num_layers, batch_size, hp.enc_hidden_size)
+            '''
+            hidden and cell should be of size
+            (num_layers * num_directions, batch, hidden_size)
+            '''
+            dirs = 2 if hp.bidirectional==True else 1
+            hidden = torch.zeros(hp.lstm_num_layers*dirs, batch_size, hp.enc_hidden_size)
+            cell = torch.zeros(hp.lstm_num_layers*dirs, batch_size, hp.enc_hidden_size)
             hidden.to(device)
             cell.to(device)
             hidden_cell = (hidden, cell)
 
         _, (hidden,cell) = self.lstm(inputs.float(), hidden_cell)
-        # hidden is (2, batch_size, hidden_size), we want (batch_size, 2*hidden_size):
+        '''
+        hidden is (num_directions, batch_size, hidden_size), 
+        we want (batch_size, num_directions*hidden_size):
+        '''
         hidden_forward, hidden_backward = torch.split(hidden,1,0)
         hidden_cat = torch.cat([hidden_forward.squeeze(0), hidden_backward.squeeze(0)],1)
         # mu and sigma:
@@ -150,7 +166,8 @@ class DecoderRNN(nn.Module):
     def __init__(self):
         super(DecoderRNN, self).__init__()
         # to init hidden and cell from z:
-        self.fc_hc = nn.Linear(hp.Nz, 2*hp.dec_hidden_size)
+        dirs = 2 if hp.bidirectional==True else 1
+        self.fc_hc = nn.Linear(hp.Nz, dirs*hp.dec_hidden_size)
         # unidirectional lstm:
         self.lstm = nn.LSTM(hp.Nz+5, hp.dec_hidden_size,\
             num_layers=hp.lstm_num_layers,dropout=hp.dropout)
@@ -234,6 +251,7 @@ class Model():
             self.rho_xy, self.q, _, _ = self.decoder(inputs, z)
         # prepare targets:
         mask,dx,dy,p = self.make_target(batch, lengths)
+
         # prepare optimizers:
         self.encoder_optimizer.zero_grad()
         self.decoder_optimizer.zero_grad()
@@ -261,6 +279,25 @@ class Model():
             self.conditional_generation(epoch)
 
     def bivariate_normal_pdf(self, dx, dy):
+        '''
+        Returns N([dx,dy] | mu_j, cov_j) for each mixture element j
+        
+        TODO: use torch distributions MultivariateNormal instead.
+        Somewhat tricky because we have a mixture of guassians.
+        Must reshape dx,dy and mu_x,mu_y so we can make a normal
+        with mu_xj,mu_yj,sigma_xj,sigma_yj for each j. It would
+        look something like:
+
+        muj = torch.tensor([self.mu_xj,self.mu_yj])
+        cov_xxj = self.sigma_xj*self.sigma_xj
+        cov_xyj = self.sigma_xj*self.sigma_yj*self.rho_xyj
+        cov_yxj = cov_xyj
+        cov_yyj = self.sigma_yj*self.sigma_yj
+        covj = [[cov_xxj,cov_xyj],[cov_yxj,cov_yyj]]
+        covj = torch.tensor(covj)
+        MVN = torch.distributions.MultivariateNormal
+        p_xyj = MVN(loc=muj,covariance_matrix=covj)
+        '''
         z_x = ((dx-self.mu_x)/self.sigma_x)**2
         z_y = ((dy-self.mu_y)/self.sigma_y)**2
         z_xy = (dx-self.mu_x)*(dy-self.mu_y)/(self.sigma_x*self.sigma_y)
